@@ -1,0 +1,1788 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import PanedWindow
+import threading
+import imaplib
+import email
+from email.header import decode_header
+import time
+import os
+import json
+from datetime import datetime, timedelta, timezone
+import logging
+import re
+import html
+import base64
+import secrets
+import sys
+import traceback
+import hashlib
+
+# ====================== 配置日志系统 ======================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("email_monitor.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("EmailMonitor")
+
+# ====================== 尝试导入音频库 ======================
+try:
+    import winsound
+    AUDIO_AVAILABLE = True
+except ImportError:
+    logger.warning("Windows声音库不可用，将禁用声音提醒")
+    AUDIO_AVAILABLE = False
+
+# ====================== 连接状态枚举 ======================
+class ConnectionState:
+    DISCONNECTED = "断开"
+    CONNECTING = "连接中"
+    CONNECTED = "已连接"
+    RECONNECTING = "重连中"
+    ERROR = "错误"
+
+# ====================== 工具类 ======================
+
+class SimpleEncryptionHelper:
+    """简化的加密助手"""
+    def __init__(self):
+        self.key_file = "email_config.key"
+        self.key = self._load_or_create_key()
+
+    def _load_or_create_key(self):
+        """加载或创建密钥"""
+        if os.path.exists(self.key_file):
+            try:
+                with open(self.key_file, 'rb') as f:
+                    return f.read()
+            except:
+                pass
+        # 创建新密钥
+        key = secrets.token_bytes(32)
+        with open(self.key_file, 'wb') as f:
+            f.write(key)
+        return key
+
+    def encrypt(self, data):
+        """加密数据"""
+        try:
+            encoded = base64.b64encode(data.encode())
+            result = bytearray()
+            key_len = len(self.key)
+            for i, byte in enumerate(encoded):
+                result.append(byte ^ self.key[i % key_len])
+            return base64.b64encode(result).decode()
+        except:
+            return base64.b64encode(data.encode()).decode()
+
+    def decrypt(self, encrypted_data):
+        """解密数据"""
+        try:
+            decoded = base64.b64decode(encrypted_data.encode())
+            result = bytearray()
+            key_len = len(self.key)
+            for i, byte in enumerate(decoded):
+                result.append(byte ^ self.key[i % key_len])
+            return base64.b64decode(result).decode()
+        except:
+            try:
+                return base64.b64decode(encrypted_data.encode()).decode()
+            except:
+                return ""
+
+class TimeChecker:
+    """改进的时间检查器"""
+    @staticmethod
+    def parse_email_date(date_str: str) -> datetime:
+        """解析邮件头中的Date字段"""
+        if not date_str:
+            return None
+        try:
+            date_str = date_str.strip()
+            formats = [
+                '%a, %d %b %Y %H:%M:%S %z',
+                '%d %b %Y %H:%M:%S %z',
+                '%a, %d %b %Y %H:%M:%S %Z',
+                '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%dT%H:%M:%S',
+                '%Y/%m/%d %H:%M:%S',
+            ]
+            for fmt in formats:
+                try:
+                    dt = datetime.strptime(date_str, fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt
+                except ValueError:
+                    continue
+            try:
+                from email.utils import parsedate_to_datetime
+                return parsedate_to_datetime(date_str)
+            except Exception as parse_err:
+                logger.warning(f"使用parsedate_to_datetime解析失败: {parse_err}")
+        except Exception as e:
+            logger.error(f"解析邮件时间失败: {date_str}, 错误: {e}")
+        return None
+
+    @staticmethod
+    def extract_best_time_from_body(body: str, email_date: datetime = None) -> tuple:
+        """从邮件正文中提取最佳参考时间"""
+        if not body:
+            return None
+        time_patterns = [
+            (r'\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?\b', '%Y-%m-%dT%H:%M:%S', "ISO格式"),
+            (r'\b\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\b', '%Y-%m-%d %H:%M:%S', "标准日期时间"),
+            (r'\b\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\b', '%Y/%m/%d %H:%M:%S', "斜杠日期时间"),
+            (r'\b\d{2}:\d{2}:\d{2}\b', '%H:%M:%S', "纯时间"),
+            (r'\b\d{2}:\d{2}\b', '%H:%M', "纯时间(无秒)"),
+        ]
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        found_times = []
+        for pattern, fmt, description in time_patterns:
+            matches = re.finditer(pattern, body)
+            for match in matches:
+                time_str = match.group()
+                try:
+                    if fmt in ['%H:%M:%S', '%H:%M']:
+                        if email_date:
+                            date_part = email_date.strftime('%Y-%m-%d')
+                            full_time_str = f"{date_part} {time_str}"
+                            full_fmt = f"%Y-%m-%d {fmt}"
+                        else:
+                            date_part = now.strftime('%Y-%m-%d')
+                            full_time_str = f"{date_part} {time_str}"
+                            full_fmt = f"%Y-%m-%d {fmt}"
+                    else:
+                        full_time_str = time_str
+                        full_fmt = fmt
+                    parsed_time = datetime.strptime(full_time_str, full_fmt)
+                    if parsed_time.tzinfo is None:
+                        parsed_time = parsed_time.replace(tzinfo=beijing_tz)
+                    if email_date:
+                        time_diff = abs((parsed_time - email_date).total_seconds())
+                        if time_diff < 3600:
+                            weight = 2
+                        else:
+                            weight = 1
+                    else:
+                        weight = 1
+                    found_times.append((parsed_time, time_str, description, weight))
+                except ValueError:
+                    continue
+        if not found_times:
+            return None
+        def get_score(item):
+            time_obj, _, _, weight = item
+            time_diff = abs((now - time_obj).total_seconds())
+            return weight * 1000 - time_diff
+        best_time = max(found_times, key=get_score)
+        return (best_time[0], best_time[1])
+
+    @staticmethod
+    def is_old_email(email_date: datetime, body: str, threshold_minutes: int = 30) -> tuple:
+        """检查邮件是否过期，返回(是否过期, 原因, 参考时间)"""
+        try:
+            beijing_tz = timezone(timedelta(hours=8))
+            now = datetime.now(beijing_tz)
+            threshold = timedelta(minutes=threshold_minutes)
+            if email_date:
+                if email_date.tzinfo is None:
+                    email_date = email_date.replace(tzinfo=timezone.utc)
+                try:
+                    email_date_beijing = email_date.astimezone(beijing_tz)
+                except:
+                    email_date_beijing = email_date.replace(tzinfo=beijing_tz)
+                time_diff = now - email_date_beijing
+                if time_diff > threshold:
+                    return (True, f"邮件发送时间已过 {time_diff.total_seconds() / 60:.1f} 分钟", email_date_beijing)
+                else:
+                    return (False, f"邮件发送时间在 {threshold_minutes} 分钟内", email_date_beijing)
+            body_time_result = TimeChecker.extract_best_time_from_body(body, email_date)
+            if body_time_result:
+                body_time, time_str = body_time_result
+                time_diff = now - body_time
+                if time_diff > threshold:
+                    return (True, f"正文时间 '{time_str}' 已过 {time_diff.total_seconds() / 60:.1f} 分钟", body_time)
+                else:
+                    return (False, f"正文时间在 {threshold_minutes} 分钟内", body_time)
+            return (False, "未找到时间信息", None)
+        except Exception as e:
+            logger.error(f"时间检查失败: {e}")
+            return (False, f"时间检查失败: {e}", None)
+
+def html_to_text(html_content):
+    """将HTML转换为纯文本"""
+    if not html_content:
+        return ""
+    try:
+        html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+        html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+        html_content = re.sub(r'<br\s*/?>', '\n', html_content, flags=re.IGNORECASE)
+        html_content = re.sub(r'</(p|div|tr|td|th)[^>]*>', '\n', html_content, flags=re.IGNORECASE)
+        html_content = re.sub(r'<[^>]+>', '', html_content)
+        html_content = html.unescape(html_content)
+        html_content = re.sub(r'\n+', '\n', html_content)
+        html_content = re.sub(r'[ \t]+', ' ', html_content)
+        html_content = re.sub(r'\n\s+\n', '\n\n', html_content)
+        return html_content.strip()
+    except Exception as e:
+        logger.error(f"HTML转换失败: {e}")
+        return re.sub(r'<[^>]+>', '', html_content)
+
+class EmailDetailDialog:
+    """邮件详情对话框"""
+    def __init__(self, parent, email_data):
+        self.parent = parent
+        self.email_data = email_data
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("邮件详情")
+        self.dialog.geometry("900x700")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.create_widgets()
+        self.load_email_data()
+        self.center_dialog()
+
+    def create_widgets(self):
+        """创建对话框组件"""
+        main_frame = ttk.Frame(self.dialog, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        title_frame = ttk.Frame(main_frame)
+        title_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Label(title_frame, text="📧 邮件详情", font=('Arial', 14, 'bold')).pack(side=tk.LEFT)
+        ttk.Button(title_frame, text="关闭", command=self.on_close, width=10).pack(side=tk.RIGHT)
+        info_frame = ttk.LabelFrame(main_frame, text="基本信息", padding=15)
+        info_frame.pack(fill=tk.X, pady=(0, 15))
+        row = 0
+        info_labels = [
+            ("发件人:", "from", "未知"),
+            ("收件人:", "to", "未知"),
+            ("时间:", "date", "未知"),
+            ("主题:", "subject", "无主题"),
+            ("匹配关键字:", "keywords", "无"),
+            ("处理状态:", "status", "未知")
+        ]
+        for label_text, key, default in info_labels:
+            ttk.Label(info_frame, text=label_text, font=('Arial', 10, 'bold')).grid(
+                row=row, column=0, sticky=tk.W, pady=5)
+            label = ttk.Label(info_frame, text="", font=('Arial', 10))
+            label.grid(row=row, column=1, sticky=tk.W, pady=5, padx=10)
+            setattr(self, f"{key}_label", label)
+            row += 1
+        body_frame = ttk.LabelFrame(main_frame, text="邮件正文", padding=10)
+        body_frame.pack(fill=tk.BOTH, expand=True)
+        self.body_text = scrolledtext.ScrolledText(body_frame, wrap=tk.WORD, font=('Arial', 10), height=20, width=80)
+        self.body_text.pack(fill=tk.BOTH, expand=True)
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=(15, 0))
+        ttk.Button(button_frame, text="📋 复制正文", command=self.copy_body, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="💾 保存到文件", command=self.save_to_file, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="✅ 标记为已处理", command=self.mark_as_processed, width=15).pack(side=tk.LEFT, padx=5)
+
+    def load_email_data(self):
+        """加载邮件数据"""
+        try:
+            for key in ['from', 'to', 'date', 'subject', 'keywords', 'status']:
+                label = getattr(self, f"{key}_label")
+                value = self.email_data.get(key, "未知")
+                label.config(text=value)
+            status_colors = {"正常警报": "red", "已忽略": "blue", "时间过期": "orange", "已处理": "green"}
+            status = self.email_data.get('status', '未知')
+            if status in status_colors:
+                self.status_label.config(foreground=status_colors[status])
+            body = self.email_data.get('body', '无正文')
+            body_text = html_to_text(body)
+            self.body_text.insert('1.0', body_text)
+            self.body_text.config(state='disabled')
+        except Exception as e:
+            logger.error(f"加载邮件数据失败: {e}")
+            self.body_text.insert('1.0', f"加载邮件数据失败: {e}")
+
+    def copy_body(self):
+        """复制正文内容"""
+        try:
+            body = self.body_text.get('1.0', 'end-1c')
+            self.dialog.clipboard_clear()
+            self.dialog.clipboard_append(body)
+            messagebox.showinfo("提示", "正文内容已复制到剪贴板")
+        except Exception as e:
+            messagebox.showerror("错误", f"复制失败: {e}")
+
+    def save_to_file(self):
+        """保存邮件到文件"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            subject_clean = re.sub(r'[<>:"/\\|?*]', '', self.email_data.get('subject', '无主题'))[:50].strip() or "无主题"
+            filename = f"邮件_{timestamp}_{subject_clean}.txt"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n邮件详情\n" + "=" * 80 + "\n\n")
+                for key, label in [("发件人", "from"), ("收件人", "to"), ("时间", "date"), ("主题", "subject"),
+                                   ("匹配关键字", "keywords"), ("状态", "status")]:
+                    f.write(f"{key}: {self.email_data.get(label, '未知')}\n")
+                f.write("\n" + "=" * 80 + "\n正文内容:\n" + "=" * 80 + "\n\n")
+                f.write(html_to_text(self.email_data.get('body', '无正文')))
+            messagebox.showinfo("保存成功", f"邮件已保存到文件:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("保存失败", f"保存文件失败: {e}")
+
+    def mark_as_processed(self):
+        """标记为已处理"""
+        try:
+            self.status_label.config(text="已处理", foreground="green")
+            self.email_data['status'] = "已处理"
+            if hasattr(self.parent, 'update_email_status'):
+                email_id = self.email_data.get('id')
+                if email_id:
+                    self.parent.update_email_status(email_id, "已处理")
+            messagebox.showinfo("提示", "邮件已标记为已处理")
+        except Exception as e:
+            messagebox.showerror("错误", f"标记失败: {e}")
+
+    def center_dialog(self):
+        """居中显示对话框"""
+        self.dialog.update_idletasks()
+        width = self.dialog.winfo_width()
+        height = self.dialog.winfo_height()
+        x = (self.dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (height // 2)
+        self.dialog.geometry(f'{width}x{height}+{x}+{y}')
+
+    def on_close(self):
+        """关闭对话框"""
+        self.dialog.grab_release()
+        self.dialog.destroy()
+
+class LoginFrame(ttk.Frame):
+    """登录界面"""
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.encryption_helper = SimpleEncryptionHelper()
+        self.server_var = tk.StringVar(value="imap.exmail.qq.com")
+        self.port_var = tk.StringVar(value="993")
+        self.username_var = tk.StringVar()
+        self.password_var = tk.StringVar()
+        self.keyword_file_var = tk.StringVar()
+        self.ignore_keyword_file_var = tk.StringVar()
+        self.sound_file_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="就绪")
+        self.create_widgets()
+        self.load_config()
+
+    def create_widgets(self):
+        """创建界面组件"""
+        main_frame = ttk.Frame(self, padding=30)
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        ttk.Label(main_frame, text="企业邮箱监控系统", font=('Arial', 18, 'bold'), foreground="#2C3E50").grid(
+            row=0, column=0, columnspan=4, pady=(0, 30))
+        config_items = [
+            ("IMAP服务器:", self.server_var, 30, None),
+            ("端口:", self.port_var, 10, None),
+            ("邮箱账号:", self.username_var, 30, None),
+            ("邮箱密码:", self.password_var, 30, "*"),
+            ("监控关键字文件:", self.keyword_file_var, 25, None),
+            ("忽略关键字文件:", self.ignore_keyword_file_var, 25, None),
+            ("自定义告警声音:", self.sound_file_var, 25, None)
+        ]
+        for i, (label_text, var, width, show) in enumerate(config_items, 1):
+            ttk.Label(main_frame, text=label_text).grid(row=i, column=0, sticky=tk.W, pady=8)
+            if label_text == "端口:":
+                frame = ttk.Frame(main_frame)
+                frame.grid(row=i, column=1, sticky=(tk.W, tk.E), pady=8, padx=5)
+                ttk.Entry(frame, textvariable=var, width=width).pack(side=tk.LEFT)
+                continue
+            frame = ttk.Frame(main_frame)
+            frame.grid(row=i, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=8, padx=5)
+            frame.columnconfigure(0, weight=1)
+            entry = ttk.Entry(frame, textvariable=var, show=show)
+            entry.grid(row=0, column=0, sticky=(tk.W, tk.E))
+            if label_text in ["监控关键字文件:", "忽略关键字文件:", "自定义告警声音:"]:
+                browse_func = getattr(self, f"browse_{'keyword' if '关键字' in label_text else 'sound'}_file")
+                ttk.Button(frame, text="浏览", command=browse_func, width=8).grid(row=0, column=1, padx=5)
+        ttk.Button(main_frame, text="测试声音", command=self.test_sound, width=12).grid(row=7, column=3, padx=5)
+        note_text = """使用说明：
+1. 监控关键字文件：每行一个关键字
+2. 忽略关键字文件：每行格式为'标题关键字:正文关键字1,正文关键字2,...'
+3. 自定义告警声音：选择.wav格式的声音文件（可选）
+4. 关键字文件修改后会自动重新加载"""
+        ttk.Label(main_frame, text=note_text, foreground="#666").grid(row=8, column=0, columnspan=4, sticky=tk.W, pady=15)
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=9, column=0, columnspan=4, pady=20)
+        ttk.Button(button_frame, text="🔗 测试连接", command=self.test_connection, width=15).pack(side=tk.LEFT, padx=10)
+        ttk.Button(button_frame, text="🚀 开始监控", command=self.login_and_start, width=15).pack(side=tk.LEFT, padx=10)
+        ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, padding=10, anchor=tk.W).grid(
+            row=10, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=(10, 0))
+
+    def browse_keyword_file(self):
+        """浏览监控关键字文件"""
+        filename = filedialog.askopenfilename(
+            title="选择监控关键字文件",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
+        )
+        if filename:
+            self.keyword_file_var.set(filename)
+
+    def browse_ignore_keyword_file(self):
+        """浏览忽略关键字文件"""
+        filename = filedialog.askopenfilename(
+            title="选择忽略关键字文件",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
+        )
+        if filename:
+            self.ignore_keyword_file_var.set(filename)
+
+    def browse_sound_file(self):
+        """浏览自定义声音文件"""
+        filename = filedialog.askopenfilename(
+            title="选择告警声音文件",
+            filetypes=[("WAV声音文件", "*.wav"), ("所有文件", "*.*")]
+        )
+        if filename:
+            self.sound_file_var.set(filename)
+
+    def load_config(self):
+        """加载配置"""
+        try:
+            if os.path.exists("email_config.json"):
+                with open("email_config.json", "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    self.server_var.set(config.get("server", "imap.exmail.qq.com"))
+                    self.port_var.set(config.get("port", "993"))
+                    self.username_var.set(config.get("username", ""))
+                    self.keyword_file_var.set(config.get("keyword_file", ""))
+                    self.ignore_keyword_file_var.set(config.get("ignore_keyword_file", ""))
+                    self.sound_file_var.set(config.get("sound_file", ""))
+                    encrypted_password = config.get("password", "")
+                    if encrypted_password:
+                        decrypted_password = self.encryption_helper.decrypt(encrypted_password)
+                        self.password_var.set(decrypted_password)
+                self.status_var.set("✅ 配置加载成功")
+                logger.info("配置加载成功")
+        except Exception as e:
+            logger.error(f"加载配置失败: {e}")
+
+    def save_config(self):
+        """保存配置"""
+        try:
+            encrypted_password = self.encryption_helper.encrypt(self.password_var.get())
+            config = {
+                "server": self.server_var.get(),
+                "port": self.port_var.get(),
+                "username": self.username_var.get(),
+                "keyword_file": self.keyword_file_var.get(),
+                "ignore_keyword_file": self.ignore_keyword_file_var.get(),
+                "sound_file": self.sound_file_var.get(),
+                "password": encrypted_password,
+                "last_updated": datetime.now().isoformat()
+            }
+            with open("email_config.json", "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            logger.info("配置保存成功")
+            return True
+        except Exception as e:
+            messagebox.showerror("错误", f"保存配置失败: {e}")
+            return False
+
+    def test_connection(self):
+        """测试连接"""
+        errors = self.validate_config()
+        if errors:
+            messagebox.showerror("配置错误", "\n".join(errors))
+            return
+        self.status_var.set("🔄 正在测试连接...")
+        thread = threading.Thread(target=self._test_connection_thread, daemon=True)
+        thread.start()
+
+    def _test_connection_thread(self):
+        """测试连接线程"""
+        mail = None
+        try:
+            server = self.server_var.get()
+            port = int(self.port_var.get())
+            username = self.username_var.get()
+            password = self.password_var.get()
+            logger.info(f"测试连接到 {server}:{port}")
+            mail = imaplib.IMAP4_SSL(server, port, timeout=30)
+            mail.login(username, password)
+            status, _ = mail.select('INBOX')
+            if status == 'OK':
+                self.after(0, lambda: self.status_var.set("✅ 连接测试成功!"))
+                logger.info("连接测试成功")
+            else:
+                self.after(0, lambda: self.status_var.set("❌ 无法访问收件箱"))
+        except Exception as e:
+            error_msg = str(e)[:100]
+            self.after(0, lambda: self.status_var.set(f"❌ 连接失败: {error_msg}"))
+            logger.error(f"连接测试失败: {e}")
+        finally:
+            if mail:
+                try:
+                    mail.logout()
+                except:
+                    pass
+
+    def test_sound(self):
+        """测试声音"""
+        if not AUDIO_AVAILABLE:
+            messagebox.showwarning("警告", "音频功能不可用")
+            return
+        sound_file = self.sound_file_var.get()
+        if sound_file and os.path.exists(sound_file):
+            try:
+                for _ in range(2):
+                    winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    time.sleep(0.5)
+                self.status_var.set("🔊 播放自定义声音")
+                logger.info(f"播放自定义声音: {sound_file}")
+            except Exception as e:
+                self.status_var.set(f"❌ 播放失败: {e}")
+                logger.error(f"播放自定义声音失败: {e}")
+        else:
+            try:
+                winsound.MessageBeep()
+                self.status_var.set("🔊 播放系统提示音")
+                logger.info("播放系统提示音")
+            except Exception as e:
+                self.status_var.set(f"❌ 播放失败: {e}")
+                logger.error(f"播放系统声音失败: {e}")
+
+    def validate_config(self):
+        """验证配置"""
+        errors = []
+        if not self.server_var.get().strip():
+            errors.append("请输入服务器地址")
+        port = self.port_var.get().strip()
+        if not port or not port.isdigit() or not (1 <= int(port) <= 65535):
+            errors.append("请输入有效的端口号 (1-65535)")
+        if '@' not in self.username_var.get().strip():
+            errors.append("请输入有效的邮箱账号")
+        if len(self.password_var.get().strip()) < 6:
+            errors.append("密码长度至少6位")
+        keyword_file = self.keyword_file_var.get().strip()
+        if not keyword_file or not os.path.exists(keyword_file):
+            errors.append("监控关键字文件不存在")
+        ignore_file = self.ignore_keyword_file_var.get().strip()
+        if ignore_file and not os.path.exists(ignore_file):
+            errors.append("忽略关键字文件不存在")
+        sound_file = self.sound_file_var.get().strip()
+        if sound_file and not os.path.exists(sound_file):
+            errors.append("自定义声音文件不存在")
+        return errors
+
+    def load_keywords(self):
+        """加载监控关键字"""
+        filename = self.keyword_file_var.get()
+        keywords = set()
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                for line in f:
+                    keyword = line.strip()
+                    if keyword:
+                        keywords.add(keyword)
+            logger.info(f"加载 {len(keywords)} 个监控关键字")
+            return keywords
+        except Exception as e:
+            messagebox.showerror("错误", f"加载监控关键字失败: {e}")
+            return set()
+
+    def load_ignore_keywords(self):
+        """加载忽略关键字"""
+        filename = self.ignore_keyword_file_var.get()
+        ignore_keywords = []
+        if not filename or not os.path.exists(filename):
+            return ignore_keywords
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or ':' not in line:
+                        continue
+                    parts = line.split(':', 1)
+                    subject_keyword = parts[0].strip()
+                    body_keywords = [kw.strip() for kw in parts[1].strip().split(',') if kw.strip()]
+                    if subject_keyword and body_keywords:
+                        ignore_keywords.append({
+                            'subject': subject_keyword,
+                            'body_keywords': body_keywords
+                        })
+            logger.info(f"加载 {len(ignore_keywords)} 个忽略关键字配对")
+            return ignore_keywords
+        except Exception as e:
+            messagebox.showwarning("警告", f"加载忽略关键字失败: {e}")
+            return []
+
+    def login_and_start(self):
+        """登录并开始监控"""
+        errors = self.validate_config()
+        if errors:
+            messagebox.showerror("配置错误", "\n".join(errors))
+            return
+        if not self.save_config():
+            return
+        keywords = self.load_keywords()
+        if not keywords:
+            messagebox.showwarning("警告", "监控关键字文件为空!")
+            return
+        ignore_keywords = self.load_ignore_keywords()
+        sound_file = self.sound_file_var.get().strip()
+        if sound_file and not os.path.exists(sound_file):
+            sound_file = ""
+        self.controller.show_main_frame(
+            server=self.server_var.get(),
+            port=int(self.port_var.get()),
+            username=self.username_var.get(),
+            password=self.password_var.get(),
+            keywords=keywords,
+            ignore_keywords=ignore_keywords,
+            keyword_file=self.keyword_file_var.get(),
+            ignore_keyword_file=self.ignore_keyword_file_var.get(),
+            sound_file=sound_file
+        )
+
+class FileWatcher:
+    """文件监视器，实时监控文件变化"""
+    def __init__(self, file_path, callback, check_interval=5):
+        self.file_path = file_path
+        self.callback = callback
+        self.check_interval = check_interval
+        self.last_mtime = 0
+        self.last_hash = ""
+        self.watching = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        """开始监视文件"""
+        if self.watching:
+            return
+        self.watching = True
+        self.thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """停止监视文件"""
+        with self.lock:
+            self.watching = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3.0)
+
+    def _watch_loop(self):
+        """监视循环"""
+        while True:
+            with self.lock:
+                if not self.watching:
+                    break
+            try:
+                if os.path.exists(self.file_path):
+                    current_mtime = os.path.getmtime(self.file_path)
+                    try:
+                        with open(self.file_path, 'rb') as f:
+                            content = f.read()
+                            current_hash = hashlib.md5(content).hexdigest()
+                    except Exception as e:
+                        logger.error(f"读取文件失败: {e}")
+                        current_hash = ""
+                    if current_mtime != self.last_mtime or current_hash != self.last_hash:
+                        self.last_mtime = current_mtime
+                        self.last_hash = current_hash
+                        self.callback()
+                else:
+                    self.last_mtime = 0
+                    self.last_hash = ""
+            except Exception as e:
+                logger.error(f"文件监视错误: {e}")
+            for _ in range(self.check_interval * 10):
+                with self.lock:
+                    if not self.watching:
+                        break
+                time.sleep(0.1)
+
+class ConnectionManager:
+    """连接管理器，负责维护IMAP连接"""
+    def __init__(self, server, port, username, password, scan_interval=300):
+        self.server = server
+        self.port = port
+        self.username = username
+        self.password = password
+        self.scan_interval = scan_interval
+        self.mail = None
+        self.connection_state = ConnectionState.DISCONNECTED
+        self.last_heartbeat = None
+        self.last_activity = None
+        self.consecutive_failures = 0
+        self.lock = threading.Lock()
+        
+        # 心跳间隔 = 扫描间隔的1/3，最小60秒，最大300秒
+        self.heartbeat_interval = self._calculate_heartbeat_interval(scan_interval)
+        logger.info(f"扫描间隔{scan_interval//60}分钟，设置心跳间隔: {self.heartbeat_interval}秒")
+    
+    def _calculate_heartbeat_interval(self, scan_interval):
+        """计算心跳间隔：扫描间隔的1/3"""
+        heartbeat = scan_interval // 3
+        
+        # 设置合理的范围：最小60秒，最大300秒（5分钟）
+        if heartbeat < 60:
+            return 60
+        elif heartbeat > 300:
+            return 300
+        return heartbeat
+    
+    def update_scan_interval(self, new_scan_interval):
+        """更新扫描间隔并重新计算心跳间隔"""
+        self.scan_interval = new_scan_interval
+        old_interval = self.heartbeat_interval
+        self.heartbeat_interval = self._calculate_heartbeat_interval(new_scan_interval)
+        if old_interval != self.heartbeat_interval:
+            logger.info(f"心跳间隔更新: {old_interval} → {self.heartbeat_interval}秒")
+    
+    def connect(self):
+        """建立连接"""
+        with self.lock:
+            if self.mail:
+                try:
+                    self.mail.logout()
+                except:
+                    pass
+                self.mail = None
+            
+            self.connection_state = ConnectionState.CONNECTING
+            try:
+                self.mail = imaplib.IMAP4_SSL(self.server, self.port, timeout=30)
+                self.mail.login(self.username, self.password)
+                self.mail.select('INBOX')
+                self.connection_state = ConnectionState.CONNECTED
+                self.last_heartbeat = datetime.now()
+                self.last_activity = datetime.now()
+                self.consecutive_failures = 0
+                return True
+            except Exception as e:
+                self.connection_state = ConnectionState.ERROR
+                self.consecutive_failures += 1
+                raise Exception(f"连接失败: {e}")
+    
+    def disconnect(self):
+        """断开连接"""
+        with self.lock:
+            if self.mail:
+                try:
+                    self.mail.logout()
+                except Exception as e:
+                    logger.debug(f"登出失败: {e}")
+                self.mail = None
+            self.connection_state = ConnectionState.DISCONNECTED
+            logger.debug("连接已断开")
+    
+    def reconnect(self):
+        """重新连接"""
+        with self.lock:
+            self.connection_state = ConnectionState.RECONNECTING
+            logger.debug("开始重新连接...")
+            try:
+                # 先断开现有连接
+                if self.mail:
+                    try:
+                        self.mail.logout()
+                    except:
+                        pass
+                    self.mail = None
+                
+                # 建立新连接
+                self.mail = imaplib.IMAP4_SSL(self.server, self.port, timeout=30)
+                self.mail.login(self.username, self.password)
+                self.mail.select('INBOX')
+                self.connection_state = ConnectionState.CONNECTED
+                self.last_heartbeat = datetime.now()
+                self.last_activity = datetime.now()
+                self.consecutive_failures = 0
+                logger.debug("重新连接成功")
+                return True
+            except Exception as e:
+                self.connection_state = ConnectionState.ERROR
+                self.consecutive_failures += 1
+                logger.error(f"重新连接失败: {e}")
+                raise Exception(f"重新连接失败: {e}")
+    
+    def should_send_heartbeat(self):
+        """判断是否需要发送心跳"""
+        if not self.last_heartbeat:
+            return True
+        
+        # 计算距离上次心跳的时间
+        time_since_last = (datetime.now() - self.last_heartbeat).total_seconds()
+        
+        # 如果超过心跳间隔，需要发送心跳
+        return time_since_last >= self.heartbeat_interval
+    
+    def send_heartbeat(self):
+        """发送心跳，返回是否成功"""
+        with self.lock:
+            if not self.mail or self.connection_state != ConnectionState.CONNECTED:
+                return False
+            
+            try:
+                # 发送NOOP命令检查连接状态
+                status, _ = self.mail.noop()
+                if status == 'OK':
+                    self.last_heartbeat = datetime.now()
+                    self.consecutive_failures = 0
+                    return True
+                else:
+                    self.connection_state = ConnectionState.ERROR
+                    self.consecutive_failures += 1
+                    logger.debug(f"心跳响应异常: {status}")
+                    return False
+            except Exception as e:
+                self.connection_state = ConnectionState.ERROR
+                self.consecutive_failures += 1
+                logger.debug(f"心跳发送失败: {e}")
+                return False
+    
+    def check_connection(self):
+        """检查连接状态（如果需要会发送心跳）"""
+        with self.lock:
+            if not self.mail or self.connection_state != ConnectionState.CONNECTED:
+                return False
+            
+            # 如果需要，发送心跳
+            if self.should_send_heartbeat():
+                return self.send_heartbeat()
+            
+            # 不需要发送心跳，连接状态正常
+            return True
+
+class MainFrame(ttk.Frame):
+    """主监控界面"""
+    def __init__(self, parent, controller, server, port, username, password,
+                 keywords, ignore_keywords, keyword_file, ignore_keyword_file,
+                 sound_file):
+        super().__init__(parent)
+        self.controller = controller
+        self.server = server
+        self.port = port
+        self.username = username
+        self.password = password
+        self.keywords = keywords
+        self.ignore_keywords = ignore_keywords
+        self.keyword_file = keyword_file
+        self.ignore_keyword_file = ignore_keyword_file
+        self.keyword_watcher = None
+        self.ignore_watcher = None
+        self.sound_file = sound_file
+        self.alert_thread = None
+        self.alert_stop_flag = threading.Event()
+        self.alert_lock = threading.Lock()
+        self.email_details = {}
+        self.email_tree_items = {}
+        self.is_monitoring = False
+        self.should_stop = False
+        self.monitor_thread = None
+        self.alerting_emails = set()
+        self.processed_emails = set()
+        self.thread_lock = threading.Lock()
+        self.scan_interval = 300
+        self.time_check_enabled = True
+        self.time_threshold = 30
+        self.data_lock = threading.Lock()
+        self.force_check_event = threading.Event()
+        
+        # 新增连接管理器
+        self.connection_manager = ConnectionManager(
+            server, port, username, password, self.scan_interval
+        )
+        self.last_scan_time = None
+        self.retry_count = 0
+        self.max_retries = 5
+        self.retry_delay_base = 5  # 指数退避基础延迟
+        
+        self.create_widgets()
+        self.log_message("🔧 监控系统初始化完成")
+        self.log_message(f"📧 监控邮箱: {username}")
+        self.log_message(f"⏰ 扫描频率: 每{self.scan_interval//60}分钟")
+        self.log_message(f"🔑 监控关键字: {len(keywords)}个")
+        if ignore_keywords:
+            self.log_message(f"🔕 忽略关键字配对: {len(ignore_keywords)}个")
+        if self.time_check_enabled:
+            self.log_message(f"⏱️ 时间检查: 启用 (阈值: {self.time_threshold}分钟)")
+        if sound_file:
+            self.log_message(f"🔊 自定义声音: {os.path.basename(sound_file)}")
+        self.start_file_watchers()
+
+    def start_file_watchers(self):
+        """启动文件监视器"""
+        if self.keyword_file and os.path.exists(self.keyword_file):
+            self.keyword_watcher = FileWatcher(
+                self.keyword_file,
+                self.on_keyword_file_changed,
+                check_interval=2
+            )
+            self.keyword_watcher.start()
+            self.log_message(f"👁️ 开始监视关键字文件: {os.path.basename(self.keyword_file)}")
+        if self.ignore_keyword_file and os.path.exists(self.ignore_keyword_file):
+            self.ignore_watcher = FileWatcher(
+                self.ignore_keyword_file,
+                self.on_ignore_file_changed,
+                check_interval=2
+            )
+            self.ignore_watcher.start()
+            self.log_message(f"👁️ 开始监视忽略关键字文件: {os.path.basename(self.ignore_keyword_file)}")
+
+    def stop_file_watchers(self):
+        """停止文件监视器"""
+        if self.keyword_watcher:
+            self.keyword_watcher.stop()
+        if self.ignore_watcher:
+            self.ignore_watcher.stop()
+
+    def on_keyword_file_changed(self):
+        """关键字文件变化回调"""
+        self.after(0, self._handle_keyword_file_change)
+
+    def on_ignore_file_changed(self):
+        """忽略关键字文件变化回调"""
+        self.after(0, self._handle_ignore_file_change)
+
+    def _handle_keyword_file_change(self):
+        """处理关键字文件变化"""
+        try:
+            new_keywords = set()
+            with open(self.keyword_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    keyword = line.strip()
+                    if keyword:
+                        new_keywords.add(keyword)
+            if new_keywords != self.keywords:
+                old_count = len(self.keywords)
+                self.keywords = new_keywords
+                new_count = len(self.keywords)
+                self.log_message(f"🔄 关键字文件已更新: {old_count} → {new_count} 个关键字")
+        except Exception as e:
+            self.log_message(f"❌ 重新加载关键字文件失败: {e}")
+
+    def _handle_ignore_file_change(self):
+        """处理忽略关键字文件变化"""
+        try:
+            new_ignore_keywords = []
+            with open(self.ignore_keyword_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or ':' not in line:
+                        continue
+                    parts = line.split(':', 1)
+                    subject_keyword = parts[0].strip()
+                    body_keywords = [kw.strip() for kw in parts[1].strip().split(',') if kw.strip()]
+                    if subject_keyword and body_keywords:
+                        new_ignore_keywords.append({
+                            'subject': subject_keyword,
+                            'body_keywords': body_keywords
+                        })
+            if new_ignore_keywords != self.ignore_keywords:
+                old_count = len(self.ignore_keywords)
+                self.ignore_keywords = new_ignore_keywords
+                new_count = len(new_ignore_keywords)
+                self.log_message(f"🔄 忽略关键字文件已更新: {old_count} → {new_count} 个配对")
+        except Exception as e:
+            self.log_message(f"❌ 重新加载忽略关键字文件失败: {e}")
+
+    def create_widgets(self):
+        """创建界面组件"""
+        main_frame = ttk.Frame(self, padding=15)
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+        
+        # 标题栏
+        title_frame = ttk.Frame(main_frame)
+        title_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        
+        # 左侧：标题和状态
+        left_frame = ttk.Frame(title_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left_frame, text="📧 邮箱监控面板", font=('Arial', 16, 'bold'), foreground="#2C3E50").pack(anchor=tk.W)
+        
+        # 状态显示
+        self.status_var = tk.StringVar(value="🟢 就绪")
+        self.connection_status_var = tk.StringVar(value="📡 连接状态: 未连接")
+        ttk.Label(left_frame, textvariable=self.status_var, font=('Arial', 11), foreground="#27AE60").pack(anchor=tk.W, pady=(5, 0))
+        ttk.Label(left_frame, textvariable=self.connection_status_var, font=('Arial', 10), foreground="#666").pack(anchor=tk.W)
+        
+        # 右侧：控制面板
+        right_frame = ttk.Frame(title_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 扫描间隔设置
+        interval_frame = ttk.Frame(right_frame)
+        interval_frame.pack(anchor=tk.E, pady=2)
+        ttk.Label(interval_frame, text="扫描间隔(分钟):").pack(side=tk.LEFT)
+        self.interval_var = tk.StringVar(value=str(self.scan_interval // 60))
+        ttk.Entry(interval_frame, textvariable=self.interval_var, width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Button(interval_frame, text="更新", command=self.update_interval, width=8).pack(side=tk.LEFT)
+        
+        # 时间检查设置
+        time_frame = ttk.Frame(right_frame)
+        time_frame.pack(anchor=tk.E, pady=2)
+        self.time_check_var = tk.BooleanVar(value=self.time_check_enabled)
+        ttk.Checkbutton(time_frame, text="时间检查", variable=self.time_check_var,
+                        command=self.update_time_check).pack(side=tk.LEFT)
+        ttk.Label(time_frame, text="阈值(分钟):").pack(side=tk.LEFT, padx=(10, 5))
+        self.time_threshold_var = tk.StringVar(value=str(self.time_threshold))
+        ttk.Entry(time_frame, textvariable=self.time_threshold_var, width=6).pack(side=tk.LEFT)
+        ttk.Button(time_frame, text="更新", command=self.update_time_threshold, width=8).pack(side=tk.LEFT, padx=5)
+        
+        # 分割窗口
+        self.paned_window = PanedWindow(main_frame, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=5)
+        self.paned_window.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        main_frame.rowconfigure(1, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        
+        # 邮件列表
+        email_frame = ttk.LabelFrame(self.paned_window, text="📬 匹配到的邮件 (双击查看详情)", padding=10)
+        email_frame.columnconfigure(0, weight=1)
+        email_frame.rowconfigure(0, weight=1)
+        columns = ("收到时间", "邮件主题", "匹配关键字", "处理状态")
+        self.email_tree = ttk.Treeview(email_frame, columns=columns, show="headings", height=8)
+        col_configs = [("收到时间", 180), ("邮件主题", 500), ("匹配关键字", 150), ("处理状态", 120)]
+        for col, width in col_configs:
+            self.email_tree.heading(col, text=col)
+            self.email_tree.column(col, width=width)
+        self.email_tree.bind('<Double-1>', self.show_email_detail)
+        scrollbar = ttk.Scrollbar(email_frame, orient=tk.VERTICAL, command=self.email_tree.yview)
+        self.email_tree.configure(yscrollcommand=scrollbar.set)
+        self.email_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # 日志区域
+        log_frame = ttk.LabelFrame(self.paned_window, text="📝 监控日志", padding=10)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(log_frame, wrap=tk.WORD, font=('Arial', 10))
+        log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        log_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        self.paned_window.add(email_frame)
+        self.paned_window.add(log_frame)
+        self.paned_window.paneconfig(email_frame, height=400, minsize=150)
+        self.paned_window.paneconfig(log_frame, height=200, minsize=100)
+        
+        # 控制按钮
+        control_frame = ttk.Frame(main_frame)
+        control_frame.grid(row=2, column=0, pady=10)
+        buttons = [
+            ("▶️ 开始监控", self.start_monitoring, None, "start_button"),
+            ("⏹️ 停止监控", self.stop_monitoring, tk.DISABLED, "stop_button"),
+            ("📥 立即收取", self.check_now, tk.DISABLED, "check_now_button"),
+            ("🔌 手动重连", self.manual_reconnect, tk.DISABLED, "reconnect_button"),
+            ("🔇 停止声音", self.stop_sound, tk.DISABLED, "sound_button"),
+            ("🗑️ 清空列表", self.clear_list, None, None),
+            ("🔄 立即检查文件", self.reload_keywords_manual, None, None),
+            ("↩️ 返回登录", self.return_to_login, None, None)
+        ]
+        for i, (text, command, state, var_name) in enumerate(buttons):
+            btn = ttk.Button(control_frame, text=text, command=command, width=15, state=state)
+            btn.grid(row=0, column=i, padx=5)
+            if var_name:
+                setattr(self, var_name, btn)
+
+    def return_to_login(self):
+        """返回到登录界面"""
+        try:
+            self.log_message("↩️ 正在返回登录界面...")
+            self.stop_monitoring()
+            self.stop_file_watchers()
+            # 添加异常处理，避免disconnect失败阻止界面切换
+            try:
+                self.connection_manager.disconnect()
+            except Exception as e:
+                self.log_message(f"⚠️ 断开连接时出错: {e}")
+                logger.error(f"断开连接错误: {traceback.format_exc()}")
+            
+            # 在主线程中切换界面
+            self.after(0, lambda: self.controller.show_login_frame())
+        except Exception as e:
+            self.log_message(f"❌ 返回登录失败: {e}")
+            logger.error(f"返回登录失败: {traceback.format_exc()}")
+            # 即使出错也尝试切换界面
+            try:
+                self.after(0, lambda: self.controller.show_login_frame())
+            except:
+                pass
+
+    def update_connection_status(self):
+        """更新连接状态显示"""
+        status = self.connection_manager.connection_state
+        status_map = {
+            ConnectionState.DISCONNECTED: "🔴 未连接",
+            ConnectionState.CONNECTING: "🟡 连接中...",
+            ConnectionState.CONNECTED: "🟢 已连接",
+            ConnectionState.RECONNECTING: "🟠 重连中...",
+            ConnectionState.ERROR: "🔴 连接错误"
+        }
+        display_text = status_map.get(status, "❓ 未知状态")
+        self.connection_status_var.set(f"📡 连接状态: {display_text}")
+
+    def check_now(self):
+        """立即收取邮件"""
+        if not self.is_monitoring:
+            self.log_message("⚠️ 请先启动监控后再点击立即收取")
+            return
+        self.log_message("🚀 手动触发立即收取...")
+        self.force_check_event.set()
+
+    def manual_reconnect(self):
+        """手动重连"""
+        if not self.is_monitoring:
+            self.log_message("⚠️ 请先启动监控")
+            return
+        self.log_message("🔄 手动触发重新连接...")
+        self.retry_count = 0
+        self.force_check_event.set()
+
+    def update_interval(self):
+        """更新扫描间隔"""
+        try:
+            minutes = int(self.interval_var.get())
+            if 1 <= minutes <= 1440:
+                new_scan_interval = minutes * 60
+                
+                # 更新扫描间隔
+                old_interval = self.scan_interval
+                self.scan_interval = new_scan_interval
+                
+                # 更新连接管理器的心跳间隔
+                self.connection_manager.update_scan_interval(new_scan_interval)
+                
+                self.log_message(f"⏰ 扫描间隔更新为 {minutes} 分钟")
+                return True
+            else:
+                messagebox.showerror("错误", "扫描间隔必须在1-1440分钟范围内")
+                return False
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的数字")
+            return False
+
+    def update_time_check(self):
+        """更新时间检查开关"""
+        self.time_check_enabled = self.time_check_var.get()
+        status = "启用" if self.time_check_enabled else "禁用"
+        self.log_message(f"⏱️ 时间检查已{status}")
+
+    def update_time_threshold(self):
+        """更新时间阈值"""
+        try:
+            threshold = int(self.time_threshold_var.get())
+            if 1 <= threshold <= 1440:
+                self.time_threshold = threshold
+                self.log_message(f"⏱️ 时间阈值更新为 {threshold} 分钟")
+                return True
+            else:
+                messagebox.showerror("错误", "时间阈值必须在1-1440分钟范围内")
+                return False
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的数字")
+            return False
+
+    def log_message(self, message):
+        """记录日志"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        self.after(0, self._update_log, log_entry)
+        logger.info(message)
+
+    def _update_log(self, log_entry):
+        """安全更新日志"""
+        try:
+            self.log_text.insert(tk.END, log_entry)
+            self.log_text.see(tk.END)
+        except Exception as e:
+            logger.error(f"更新日志错误: {e}")
+
+    def add_email(self, email_id, time_str, subject, keywords, status, email_data):
+        """添加邮件到列表"""
+        subject_clean = self.clean_subject(subject)
+        subject_display = subject_clean[:100] + "..." if len(subject_clean) > 100 else subject_clean
+        email_data['subject'] = subject_clean
+        if 'raw_msg' in email_data:
+            del email_data['raw_msg']
+        with self.data_lock:
+            self.email_details[email_id] = email_data
+        self.after(0, self._update_email_tree, email_id, time_str, subject_display, keywords, status)
+
+    def clean_subject(self, text):
+        """清理文本中的换行符和多余空格"""
+        if not text:
+            return "无主题"
+        text = re.sub(r'[\r\n]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    def _update_email_tree(self, email_id, time_str, subject, keywords, status):
+        """更新邮件列表"""
+        item_id = self.email_tree.insert("", 0, values=(time_str, subject, keywords, status))
+        self.email_tree_items[email_id] = item_id
+        status_colors = {
+            "正常警报": "red",
+            "已忽略": "blue",
+            "时间过期": "orange",
+            "已处理": "green"
+        }
+        if status in status_colors:
+            self.email_tree.item(item_id, tags=(status,))
+            self.email_tree.tag_configure(status, foreground=status_colors[status])
+
+    def update_email_status(self, email_id, new_status):
+        """更新邮件状态"""
+        with self.data_lock:
+            if email_id in self.email_tree_items:
+                item_id = self.email_tree_items[email_id]
+                current_values = self.email_tree.item(item_id, 'values')
+                new_values = (current_values[0], current_values[1], current_values[2], new_status)
+                self.email_tree.item(item_id, values=new_values)
+                if email_id in self.email_details:
+                    self.email_details[email_id]['status'] = new_status
+                status_colors = {"正常警报": "red", "已忽略": "blue", "时间过期": "orange", "已处理": "green"}
+                if new_status in status_colors:
+                    self.email_tree.item(item_id, tags=(new_status,))
+                    self.email_tree.tag_configure(new_status, foreground=status_colors[new_status])
+
+    def show_email_detail(self, event):
+        """显示邮件详情"""
+        selection = self.email_tree.selection()
+        if not selection:
+            return
+        item_id = selection[0]
+        email_id = None
+        with self.data_lock:
+            for eid, tid in self.email_tree_items.items():
+                if tid == item_id:
+                    email_id = eid
+                    break
+            if email_id and email_id in self.email_details:
+                EmailDetailDialog(self, self.email_details[email_id])
+            else:
+                messagebox.showwarning("提示", "无法找到邮件详细信息")
+
+    def clear_list(self):
+        """清空列表（但保留已处理邮件记录）"""
+        for item in self.email_tree.get_children():
+            self.email_tree.delete(item)
+        with self.data_lock:
+            self.email_details.clear()
+            self.email_tree_items.clear()
+            # 重要：不要清除 processed_emails，只清除 alerting_emails
+            # self.processed_emails.clear()  # 注释掉这行！
+        with self.thread_lock:
+            self.alerting_emails.clear()
+        self.stop_sound()
+        self.log_message("📭 已清空邮件列表（保留已处理记录）")
+
+    def reload_keywords_manual(self):
+        """手动重新加载关键字"""
+        self._handle_keyword_file_change()
+        self._handle_ignore_file_change()
+        self.log_message("✅ 关键字已重新加载")
+
+    def start_monitoring(self):
+        """开始监控"""
+        if self.is_monitoring:
+            self.log_message("⚠️ 监控已经在运行中")
+            return
+        self.is_monitoring = True
+        self.should_stop = False
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.check_now_button.config(state=tk.NORMAL)
+        self.reconnect_button.config(state=tk.NORMAL)
+        self.sound_button.config(state=tk.NORMAL)
+        self.status_var.set("🟡 监控中...")
+        self.log_message("🚀 开始邮箱监控")
+        self.log_message(f"⏰ 扫描频率: 每{self.scan_interval//60}分钟")
+        if self.ignore_keywords:
+            self.log_message(f"🔕 已启用 {len(self.ignore_keywords)} 个忽略配对")
+        if self.time_check_enabled:
+            self.log_message(f"⏱️ 时间检查已启用，阈值: {self.time_threshold}分钟")
+        if self.sound_file:
+            self.log_message(f"🔊 使用自定义告警声音")
+        self.log_message("📊 启动监控线程...")
+        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+    def stop_monitoring(self):
+        """停止监控"""
+        self.is_monitoring = False
+        self.should_stop = True
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.check_now_button.config(state=tk.DISABLED)
+        self.reconnect_button.config(state=tk.DISABLED)
+        self.sound_button.config(state=tk.DISABLED)
+        self.status_var.set("🔴 已停止")
+        self.log_message("⏹️ 停止监控")
+        self.stop_sound()
+        # 断开连接
+        try:
+            self.connection_manager.disconnect()
+        except Exception as e:
+            self.log_message(f"⚠️ 断开连接时出错: {e}")
+
+    def stop_sound(self):
+        """停止声音"""
+        if not AUDIO_AVAILABLE:
+            return
+        self.alert_stop_flag.set()
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+            self.log_message("🔇 停止声音")
+        except Exception as e:
+            self.log_message(f"停止声音失败: {e}")
+
+    def play_alert_sound_loop(self):
+        """循环播放告警声音"""
+        if not AUDIO_AVAILABLE:
+            return
+        self.alert_stop_flag.clear()
+        self.log_message("🔊 开始循环播放告警声音")
+        try:
+            while not self.alert_stop_flag.is_set() and not self.should_stop:
+                with self.alert_lock:
+                    if not self.alerting_emails:
+                        break
+                if self.sound_file and os.path.exists(self.sound_file):
+                    winsound.PlaySound(self.sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                else:
+                    winsound.MessageBeep()
+                for _ in range(15):
+                    if self.alert_stop_flag.is_set() or self.should_stop:
+                        break
+                    time.sleep(0.1)
+        except Exception as e:
+            self.log_message(f"播放告警声音失败: {e}")
+        finally:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+            self.log_message("🔇 告警声音停止")
+
+    def trigger_alert(self):
+        """触发警报"""
+        with self.alert_lock:
+            if not self.alerting_emails:
+                return
+            self.alert_stop_flag.set()
+            if self.alert_thread and self.alert_thread.is_alive():
+                try:
+                    self.alert_thread.join(timeout=2.0)
+                except:
+                    pass
+            self.alert_stop_flag.clear()
+            self.alert_thread = threading.Thread(target=self.play_alert_sound_loop, daemon=True)
+            self.alert_thread.start()
+
+    def check_keywords(self, subject, body):
+        """检查关键词"""
+        content = f"{subject} {body}".lower()
+        return [keyword for keyword in self.keywords if keyword.lower() in content]
+
+    def check_ignore_keywords(self, subject, body):
+        """检查忽略关键词"""
+        if not self.ignore_keywords:
+            return (False, None)
+        subject_lower = subject.lower()
+        body_lower = body.lower()
+        for pair in self.ignore_keywords:
+            if pair['subject'].lower() in subject_lower:
+                if all(body_keyword.lower() in body_lower for body_keyword in pair['body_keywords']):
+                    return (True, pair)
+        return (False, None)
+
+    def get_email_body(self, msg):
+        """获取邮件正文"""
+        body = ""
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    if "attachment" in str(part.get("Content-Disposition", "")):
+                        continue
+                    if content_type in ["text/plain", "text/html"]:
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                content = payload.decode(charset, errors='ignore')
+                                body += content
+                        except:
+                            pass
+            else:
+                content_type = msg.get_content_type()
+                if content_type in ["text/plain", "text/html"]:
+                    try:
+                        payload = msg.get_payload(decode=True)
+                        if payload:
+                            charset = msg.get_content_charset() or 'utf-8'
+                            body = payload.decode(charset, errors='ignore')
+                    except:
+                        pass
+            return body[:10000]
+        except Exception as e:
+            self.log_message(f"提取正文失败: {e}")
+            return ""
+
+    def decode_header(self, text):
+        """解码邮件头并清理换行符"""
+        if not text:
+            return ""
+        try:
+            decoded_parts = decode_header(text)
+            result = ""
+            for part, encoding in decoded_parts:
+                if isinstance(part, bytes):
+                    try:
+                        decoded = part.decode(encoding or 'utf-8', errors='ignore')
+                        result += self.clean_subject(decoded)
+                    except:
+                        result += part.decode('utf-8', errors='ignore')
+                else:
+                    result += self.clean_subject(str(part))
+            return result
+        except:
+            return self.clean_subject(str(text))
+
+    def mark_email_as_read(self, email_id):
+        """标记邮件为已读"""
+        try:
+            self.connection_manager.mail.store(email_id, '+FLAGS', '\\Seen')
+        except Exception as e:
+            self.log_message(f"标记邮件为已读失败: {e}")
+
+    def perform_scan(self):
+        """执行一次扫描"""
+        try:
+            # 检查连接状态
+            if not self.connection_manager.check_connection():
+                self.log_message("🔌 连接检查失败，尝试重新连接...")
+                self.update_connection_status()
+                try:
+                    if self.connection_manager.reconnect():
+                        self.log_message("✅ 重新连接成功")
+                        self.update_connection_status()
+                    else:
+                        self.log_message("❌ 重连失败，稍后重试")
+                        return False
+                except Exception as e:
+                    self.log_message(f"❌ 重连失败: {e}")
+                    return False
+            
+            # 搜索未读邮件
+            _, messages = self.connection_manager.mail.search(None, 'UNSEEN')
+            if messages[0]:
+                email_ids = messages[0].split()
+                self.log_message(f"📧 发现 {len(email_ids)} 封新邮件")
+                batch_size = 50
+                for i in range(0, len(email_ids), batch_size):
+                    batch = email_ids[i:i + batch_size]
+                    self.log_message(f"🔍 处理批次 {i//batch_size + 1}/{(len(email_ids)-1)//batch_size + 1} ({len(batch)} 封邮件)")
+                    for email_id in batch:
+                        if self.should_stop:
+                            break
+                        try:
+                            # 获取邮件UID
+                            _, uid_data = self.connection_manager.mail.fetch(email_id, '(UID)')
+                            uid_match = re.search(r'UID (\d+)', uid_data[0].decode())
+                            if uid_match:
+                                email_uid = uid_match.group(1)
+                                email_key = f"{self.username}:{email_uid}"
+                            else:
+                                email_key = f"{self.username}:{email_id.decode()}"
+                        except:
+                            email_key = f"{self.username}:{email_id.decode()}"
+                        
+                        with self.data_lock:
+                            if email_key in self.processed_emails:
+                                continue
+                        
+                        try:
+                            # 获取邮件内容
+                            _, msg_data = self.connection_manager.mail.fetch(email_id, '(RFC822)')
+                            msg = email.message_from_bytes(msg_data[0][1])
+                            subject = self.decode_header(msg.get("subject", ""))
+                            from_addr = self.decode_header(msg.get("from", ""))
+                            to_addr = self.decode_header(msg.get("to", ""))
+                            date_str = self.decode_header(msg.get("date", ""))
+                            body = self.get_email_body(msg)
+                            email_date = TimeChecker.parse_email_date(date_str)
+                            email_data = {
+                                'id': email_key,
+                                'from': from_addr,
+                                'to': to_addr,
+                                'date': date_str,
+                                'subject': subject,
+                                'body': body
+                            }
+                            self.log_message(f"📨 处理邮件: {subject[:50]}...")
+                            
+                            # 检查忽略关键词
+                            is_ignored, ignore_pair = self.check_ignore_keywords(subject, body)
+                            if is_ignored:
+                                body_keywords_str = ", ".join(ignore_pair['body_keywords'])
+                                self.log_message(f"🔕 忽略配对: {ignore_pair['subject']}:{body_keywords_str}")
+                                self.add_email(
+                                    email_key,
+                                    datetime.now().strftime("%H:%M:%S"),
+                                    subject,
+                                    f"忽略配对: {ignore_pair['subject']}",
+                                    "已忽略",
+                                    email_data
+                                )
+                                with self.data_lock:
+                                    self.processed_emails.add(email_key)
+                                self.mark_email_as_read(email_id)
+                                continue
+                            
+                            # 检查时间过期
+                            if self.time_check_enabled:
+                                is_old, reason, ref_time = TimeChecker.is_old_email(email_date, body, self.time_threshold)
+                                if is_old:
+                                    time_str = ref_time.strftime("%Y-%m-%d %H:%M:%S") if ref_time else "未知时间"
+                                    self.log_message(f"⏱️ {reason}")
+                                    self.add_email(
+                                        email_key,
+                                        datetime.now().strftime("%H:%M:%S"),
+                                        subject,
+                                        reason,
+                                        "时间过期",
+                                        email_data
+                                    )
+                                    with self.data_lock:
+                                        self.processed_emails.add(email_key)
+                                    self.mark_email_as_read(email_id)
+                                    continue
+                            
+                            # 检查监控关键词
+                            matched_keywords = self.check_keywords(subject, body)
+                            if matched_keywords:
+                                keywords_str = ", ".join(matched_keywords)
+                                self.log_message(f"🔥 命中关键词: {keywords_str}")
+                                self.add_email(
+                                    email_key,
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    subject,
+                                    keywords_str,
+                                    "正常警报",
+                                    email_data
+                                )
+                                with self.thread_lock:
+                                    self.alerting_emails.add(email_key)
+                                self.trigger_alert()
+                                with self.data_lock:
+                                    self.processed_emails.add(email_key)
+                                self.mark_email_as_read(email_id)
+                                
+                        except Exception as e:
+                            self.log_message(f"❌ 处理邮件失败: {e}")
+                            logger.error(f"处理邮件失败详细信息: {traceback.format_exc()}")
+                            continue
+                    time.sleep(0.5)
+            else:
+                self.log_message("📭 暂无新邮件")
+            
+            # 记录扫描时间
+            self.last_scan_time = datetime.now()
+            self.retry_count = 0  # 重置重试计数
+            return True
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.log_message(f"❌ 扫描失败: {error_msg}")
+            logger.error(f"扫描失败详细信息: {traceback.format_exc()}")
+            return False
+
+    def monitor_loop(self):
+        """监控主循环"""
+        self.log_message("🔄 初始化连接...")
+        try:
+            self.connection_manager.connect()
+            self.update_connection_status()
+            self.log_message("✅ 连接成功")
+        except Exception as e:
+            self.log_message(f"❌ 初始连接失败: {e}")
+            self.update_connection_status()
+            self.after(0, self.stop_monitoring)
+            return
+        
+        last_heartbeat_time = datetime.now()
+        
+        while self.is_monitoring and not self.should_stop:
+            try:
+                # 检查是否需要发送心跳
+                now = datetime.now()
+                if (now - last_heartbeat_time).total_seconds() >= 30:  # 每30秒检查一次心跳
+                    if self.connection_manager.send_heartbeat():
+                        last_heartbeat_time = now
+                        # 更新连接状态显示
+                        self.update_connection_status()
+                
+                # 检查强制检查事件
+                if self.force_check_event.is_set():
+                    self.log_message("🚀 执行强制检查...")
+                    self.force_check_event.clear()
+                    self.perform_scan()
+                    if self.last_scan_time:
+                        next_scan_seconds = self.scan_interval - (datetime.now() - self.last_scan_time).total_seconds()
+                        if next_scan_seconds > 0:
+                            self.log_message(f"⏳ 等待 {int(next_scan_seconds//60)}分{int(next_scan_seconds%60)}秒后下次检查...")
+                
+                # 计算距离下次扫描的时间
+                if self.last_scan_time:
+                    time_since_last_scan = (now - self.last_scan_time).total_seconds()
+                    time_until_next_scan = max(0, self.scan_interval - time_since_last_scan)
+                else:
+                    time_until_next_scan = 0
+                
+                # 如果到了扫描时间，执行扫描
+                if time_until_next_scan == 0:
+                    success = self.perform_scan()
+                    if not success:
+                        # 扫描失败，指数退避重试
+                        self.retry_count += 1
+                        if self.retry_count >= self.max_retries:
+                            self.log_message("❌ 重试次数达到上限，停止监控")
+                            self.after(0, self.stop_monitoring)
+                            return
+                        
+                        # 计算重试延迟（指数退避）
+                        retry_delay = min(self.retry_delay_base * (2 ** (self.retry_count - 1)), 300)  # 最大5分钟
+                        self.log_message(f"🔄 {retry_delay}秒后重试 (第{self.retry_count}次)")
+                        
+                        # 等待重试
+                        for _ in range(int(retry_delay)):
+                            if self.should_stop or not self.is_monitoring:
+                                break
+                            if self.force_check_event.is_set():
+                                self.force_check_event.clear()
+                                break
+                            time.sleep(1)
+                        continue
+                
+                # 等待下一次扫描或强制检查
+                wait_interval = min(time_until_next_scan, 1)  # 最多等待1秒再检查
+                for _ in range(int(wait_interval * 10)):  # 每0.1秒检查一次
+                    if self.should_stop or not self.is_monitoring:
+                        break
+                    if self.force_check_event.is_set():
+                        self.force_check_event.clear()
+                        break
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                self.log_message(f"❌ 监控循环错误: {e}")
+                logger.error(f"监控循环错误详细信息: {traceback.format_exc()}")
+                
+                # 等待一段时间后重试
+                for _ in range(10):
+                    if self.should_stop or not self.is_monitoring:
+                        break
+                    time.sleep(1)
+        
+        # 监控结束，断开连接
+        try:
+            self.connection_manager.disconnect()
+        except Exception as e:
+            self.log_message(f"⚠️ 断开连接时出错: {e}")
+        self.update_connection_status()
+        self.log_message("🔚 监控循环结束")
+
+class EmailMonitorApp(tk.Tk):
+    """应用主类，管理界面切换"""
+    def __init__(self):
+        super().__init__()
+        self.title("企业邮箱监控系统 v2.0")
+        self.geometry("1200x800")
+        self.minsize(1000, 600)
+        self.center_window()
+        self.style = ttk.Style(self)
+        self.style.theme_use("clam")
+        self.container = ttk.Frame(self)
+        self.container.pack(fill=tk.BOTH, expand=True)
+        self.container.grid_rowconfigure(0, weight=1)
+        self.container.grid_columnconfigure(0, weight=1)
+        self.frames = {}
+        self._create_frames()
+        self.show_login_frame()
+
+    def center_window(self):
+        """窗口居中"""
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f'{width}x{height}+{x}+{y}')
+
+    def _create_frames(self):
+        """创建所有框架"""
+        # 只创建LoginFrame，MainFrame会在需要时动态创建
+        frame = LoginFrame(self.container, self)
+        self.frames[LoginFrame] = frame
+        frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+    def show_login_frame(self):
+        """显示登录界面"""
+        # 如果存在MainFrame，则销毁它
+        if hasattr(self, 'main_frame') and self.main_frame:
+            try:
+                self.main_frame.stop_monitoring()
+                self.main_frame.stop_file_watchers()
+                # 添加异常处理
+                try:
+                    self.main_frame.connection_manager.disconnect()
+                except Exception as e:
+                    logger.error(f"断开连接失败: {e}")
+            except Exception as e:
+                logger.error(f"停止监控失败: {e}")
+            finally:
+                # 确保销毁
+                self.main_frame.destroy()
+                self.main_frame = None
+        
+        # 显示登录界面
+        frame = self.frames[LoginFrame]
+        frame.tkraise()
+        self.title("企业邮箱监控系统 - 登录")
+
+    def show_main_frame(self, **kwargs):
+        """显示主监控界面"""
+        # 创建MainFrame并传递参数
+        self.main_frame = MainFrame(self.container, self, **kwargs)
+        self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.main_frame.tkraise()
+        self.title("企业邮箱监控系统 - 监控面板")
+
+    def on_closing(self):
+        """关闭应用时的处理"""
+        if hasattr(self, 'main_frame') and self.main_frame:
+            try:
+                self.main_frame.stop_monitoring()
+                self.main_frame.stop_file_watchers()
+                self.main_frame.connection_manager.disconnect()
+            except Exception as e:
+                logger.error(f"关闭应用时出错: {e}")
+        self.destroy()
+
+if __name__ == "__main__":
+    try:
+        app = EmailMonitorApp()
+        app.protocol("WM_DELETE_WINDOW", app.on_closing)
+        app.mainloop()
+    except Exception as e:
+        logger.critical(f"应用启动失败: {e}")
+        messagebox.showerror("致命错误", f"应用启动失败: {e}")
